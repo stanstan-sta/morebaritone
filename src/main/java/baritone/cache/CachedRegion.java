@@ -107,7 +107,10 @@ public final class CachedRegion implements ICachedRegion {
         return chunks[x >> 4][z >> 4] != null;
     }
 
-    public final ArrayList<BlockPos> getLocationsOf(String block) {
+    // Synchronized like the other region methods: the block index and chunk
+    // table are mutated under the region lock by update/load/removeExpired
+    // while lookup threads read them here.
+    public final synchronized ArrayList<BlockPos> getLocationsOf(String block) {
         ArrayList<BlockPos> res = new ArrayList<>();
         BitSet index = blockChunkIndex.get(block);
         if (index == null || index.isEmpty()) {
@@ -175,7 +178,11 @@ public final class CachedRegion implements ICachedRegion {
                     GZIPOutputStream gzipOut = new GZIPOutputStream(fileOut, 16384);
                     DataOutputStream out = new DataOutputStream(gzipOut)
             ) {
-                out.writeInt(CACHED_REGION_MAGIC_V2);
+                // V1 magic: the block-type index is rebuilt at load from the
+                // stored special locations, so files stay readable by other
+                // Baritone builds sharing this cache directory. The V2 loader
+                // path is kept for files already written in V2.
+                out.writeInt(CACHED_REGION_MAGIC);
                 for (int x = 0; x < 32; x++) {
                     for (int z = 0; z < 32; z++) {
                         CachedChunk chunk = this.chunks[x][z];
@@ -219,18 +226,6 @@ public final class CachedRegion implements ICachedRegion {
                     for (int z = 0; z < 32; z++) {
                         if (chunks[x][z] != null) {
                             out.writeLong(chunks[x][z].cacheTimestamp);
-                        }
-                    }
-                }
-                // ── V2: per-chunk blockTypesPresent ──────────────────────────
-                for (int x = 0; x < 32; x++) {
-                    for (int z = 0; z < 32; z++) {
-                        if (chunks[x][z] != null) {
-                            Set<String> types = chunks[x][z].getBlockTypesPresent();
-                            out.writeShort(types.size());
-                            for (String blockName : types) {
-                                out.writeUTF(blockName);
-                            }
                         }
                     }
                 }

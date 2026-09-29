@@ -32,6 +32,8 @@ public class FabricMixinPlugin implements IMixinConfigPlugin {
 
     private static boolean isBaritonePresent;
 
+    private static boolean duplicateWarned;
+
     @Override
     public void onLoad(String mixinPackage) {
         if (loaded) return;
@@ -51,6 +53,13 @@ public class FabricMixinPlugin implements IMixinConfigPlugin {
         if (!mixinClassName.startsWith(mixinPackage)) {
             throw new RuntimeException("Mixin " + mixinClassName + " is not in the mixin package");
         } else {
+            // Disabling every mixin when a standalone 'baritone' mod is present
+            // is intentional (avoids double-applied mixins), but it silently
+            // removes all fork behavior. Say so loudly, once.
+            if (isBaritonePresent && !duplicateWarned) {
+                duplicateWarned = true;
+                System.out.println("[baritone-meteor] Standalone 'baritone' mod detected: disabling our mixins to avoid conflicts. Remove one of the two Baritone jars.");
+            }
             return !isBaritonePresent;
         }
     }

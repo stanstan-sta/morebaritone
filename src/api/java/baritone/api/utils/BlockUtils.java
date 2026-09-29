@@ -76,9 +76,10 @@ public class BlockUtils {
             ));
         }
 
-        // Stone variants
-        BLOCK_VARIANTS.put("stone", Arrays.asList("cobblestone", "stone_bricks", "smooth_stone"));
-        BLOCK_VARIANTS.put("cobblestone", Arrays.asList("stone", "stone_bricks", "smooth_stone"));
+        // Stone variants: cobblestone is the drop of stone and vice versa.
+        // stone_bricks/smooth_stone are crafted building blocks, not stone.
+        BLOCK_VARIANTS.put("stone", Arrays.asList("cobblestone"));
+        BLOCK_VARIANTS.put("cobblestone", Arrays.asList("stone"));
 
         // Deepslate variants
         BLOCK_VARIANTS.put("deepslate", Arrays.asList(
@@ -128,6 +129,7 @@ public class BlockUtils {
 
         List<String> allWoodAny = new ArrayList<>();
         List<String> allLogs = new ArrayList<>();
+        List<String> allPlanks = new ArrayList<>();
 
         for (String wood : woodTypes) {
             String stemOrLog = wood.equals("crimson") || wood.equals("warped") ? "stem" : "log";
@@ -144,10 +146,13 @@ public class BlockUtils {
 
             allLogs.add(logBlock);
             allLogs.add(strippedLog);
+
+            // Planks are their own crafted blocks (oak_planks, ...), not logs.
+            allPlanks.add(wood + "_planks");
         }
         // "wood" mines all wood-type blocks (wood, log, stripped variants, all species)
         CATEGORY_ALIASES.put("wood", allWoodAny);
-        CATEGORY_ALIASES.put("planks", allWoodAny);
+        CATEGORY_ALIASES.put("planks", allPlanks);
         // "logs" mines only log-type blocks (log, stripped_log, all species)
         CATEGORY_ALIASES.put("logs", allLogs);
         CATEGORY_ALIASES.put("stripped_logs", allLogs);

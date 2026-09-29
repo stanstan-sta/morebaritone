@@ -30,6 +30,7 @@ import baritone.api.task.ITaskPlan;
 import baritone.api.task.StepStatus;
 import baritone.api.task.TaskOutcome;
 import baritone.api.utils.BetterBlockPos;
+import baritone.api.utils.BlockUtils;
 import baritone.api.utils.Rotation;
 import baritone.api.utils.RotationUtils;
 import baritone.api.utils.input.Input;
@@ -104,7 +105,6 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     private static final int INTERACT_TIMEOUT   = 40;
     private static final int SLEEP_VERIFY_TICKS = 60;
     private static final int BED_SCAN_RADIUS    = 64;
-    private static final long NIGHT_START_TICK  = 12542L;
 
     // -- Smelt-plan step tags --------------------------------------------------
     private static final String STEP_FIND_FURNACE = "Find furnace";
@@ -792,7 +792,10 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         if (plan.smeltFurnaces == null || plan.smeltFurnaces.isEmpty()) {
             List<BlockPos> found = findNearbyFurnaces(plan.smeltFurnaceName, fb, plan.smeltMaxSearchRadius);
             if (found.isEmpty()) { failStep(TaskOutcome.NOT_FOUND); return cancelPath(); }
-            plan.smeltFurnaces = List.of(found.get(0));
+            // Keep the whole sorted (nearest-first) list: single-furnace
+            // truncation made isMultiFurnaceSmelt() unreachable and killed
+            // furnace rotation in tickCollectOutput/tickMonitorSmelt.
+            plan.smeltFurnaces = List.copyOf(found);
             plan.smeltFurnaceIndex = 0;
             plan.smeltNoWorkVisits = 0;
         } else if (plan.smeltFurnaceIndex < 0 || plan.smeltFurnaceIndex >= plan.smeltFurnaces.size()) {
@@ -910,6 +913,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 plan.smeltLoadPhase = LOAD_PHASE_FUEL;
                 plan.smeltMonitorTick = 0;
                 stepIdx = 3; // back to await menu (already open)
+                return pause(); // rewound, not done: skip succeedStep() below
             } else if (shouldKeepCycling) {
                 plan.smeltNoWorkVisits = 0;
                 plan.smeltDidWorkAtCurrentFurnace = false;
@@ -918,12 +922,14 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 plan.smeltMonitorTick = 0;
                 ctx.player().closeContainer();
                 stepIdx = 0;
+                return pause(); // rewound, not done: skip succeedStep() below
             } else if (++plan.smeltNoWorkVisits < plan.smeltFurnaces.size()) {
                 advanceSmeltFurnaceTarget();
                 plan.smeltLoadPhase = LOAD_PHASE_FUEL;
                 plan.smeltMonitorTick = 0;
                 ctx.player().closeContainer();
                 stepIdx = 0;
+                return pause(); // rewound, not done: skip succeedStep() below
             } else if (!isSmeltTargetMet()) {
                 failStep(TaskOutcome.INTERACTION_FAILED);
                 return cancelPath();
@@ -932,6 +938,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
             plan.smeltLoadPhase = LOAD_PHASE_FUEL;
             plan.smeltMonitorTick = 0;
             stepIdx = 3;
+            return pause(); // rewound, not done: skip succeedStep() below
         } else if (!isSmeltTargetMet()) {
             failStep(TaskOutcome.INTERACTION_FAILED);
             return cancelPath();
@@ -1246,6 +1253,10 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     // --- World helpers --------------------------------------------------------
 
     private List<BlockPos> findNearbyBeds() {
+        // Cache-first: beds are tracked blocks, so a cache hit avoids the
+        // ~2M-block brute-force cube scan below on the tick thread.
+        List<BlockPos> cached = findCachedBeds(BED_SCAN_RADIUS);
+        if (!cached.isEmpty()) return cached;
         List<BlockPos> r = new ArrayList<>();
         BetterBlockPos pf = ctx.playerFeet();
         int minY = Math.max(ctx.world().getMinY(), pf.y - BED_SCAN_RADIUS);
@@ -1259,9 +1270,37 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 }
         return r;
     }
+
+    // Cache-first bed lookup shared with the brute-force fallback above.
+    // Cached positions are verified live (foot half, still a bed, in range)
+    // so stale entries can never produce a phantom bed.
+    private List<BlockPos> findCachedBeds(int radius) {
+        List<BlockPos> r = new ArrayList<>();
+        try {
+            var cachedWorld = baritone.getWorldProvider().getCurrentWorld().getCachedWorld();
+            if (cachedWorld == null) return r;
+            BetterBlockPos pf = ctx.playerFeet();
+            int minY = Math.max(ctx.world().getMinY(), pf.y - radius);
+            int maxY = Math.min(ctx.world().getMaxY(), pf.y + radius + 1);
+            for (net.minecraft.world.level.block.Block bed : BED_BLOCKS) {
+                String name = BlockUtils.blockToString(bed);
+                for (BlockPos pos : cachedWorld.getLocationsOf(name, Integer.MAX_VALUE, pf.x, pf.z, 2)) {
+                    if (Math.abs(pos.getX() - pf.x) > radius
+                            || Math.abs(pos.getZ() - pf.z) > radius
+                            || pos.getY() < minY || pos.getY() >= maxY) continue;
+                    BlockState state = ctx.world().getBlockState(pos);
+                    if (state.getBlock() == bed && state.getValue(BedBlock.PART) == BedPart.FOOT) r.add(pos);
+                }
+            }
+        } catch (Exception ignored) {
+            // Cache unavailable or registries not ready: caller falls back
+            // to the brute-force scan.
+        }
+        return r;
+    }
     private boolean isNightOrThunder() {
         long dayTime = ctx.world().getDayTime() % 24000L;
-        return dayTime >= NIGHT_START_TICK || ctx.world().isThundering();
+        return SleepWindow.canSleep(dayTime, ctx.world().isThundering());
     }
     private baritone.api.pathing.goals.Goal buildBedGoal() {
         if (plan.bedCandidates != null && plan.bedCandidates.size() > 1)

@@ -164,7 +164,8 @@ public abstract class MixinClientPlayNetHandler extends ClientCommonPacketListen
         if (!Baritone.settings().repackOnAnyBlockChange.value) {
             return;
         }
-        if (!CachedChunk.BLOCKS_TO_KEEP_TRACK_OF.contains(packetIn.getBlockState().getBlock())) {
+        // Single registry with ChunkPacker: only repack for blocks the cache stores.
+        if (!CachedChunk.getBlocksToKeepTrackOf().contains(packetIn.getBlockState().getBlock())) {
             return;
         }
         for (IBaritone ibaritone : BaritoneAPI.getProvider().getAllBaritones()) {

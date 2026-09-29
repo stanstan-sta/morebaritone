@@ -26,6 +26,7 @@ import baritone.api.process.PathingCommand;
 import baritone.api.process.PathingCommandType;
 import baritone.api.task.TaskOutcome;
 import baritone.api.utils.BetterBlockPos;
+import baritone.api.utils.BlockUtils;
 import baritone.api.utils.Rotation;
 import baritone.api.utils.RotationUtils;
 import baritone.api.utils.input.Input;
@@ -75,12 +76,6 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
     /** Vanilla requires the player to be within ~3 blocks of a bed to sleep.
      *  Squared distance threshold (3^2) for proximity checks. */
     private static final double SLEEP_PROXIMITY_SQ = 9.0;
-
-    /**
-     * Day-time tick value at which players are allowed to sleep in the
-     * overworld (equivalent to dusk).
-     */
-    private static final long NIGHT_START_TICK = 12542L;
 
     /** All 16 bed block variants for scanning. */
     private static final List<net.minecraft.world.level.block.Block> BED_BLOCKS = Arrays.asList(
@@ -337,6 +332,10 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
      * for the same physical bed).
      */
     private List<BlockPos> findNearbyBeds() {
+        // Cache-first: beds are tracked blocks, so a cache hit avoids the
+        // ~2M-block brute-force cube scan below on the tick thread.
+        List<BlockPos> cached = findCachedBeds();
+        if (!cached.isEmpty()) return cached;
         List<BlockPos> result = new ArrayList<>();
         BetterBlockPos pf = ctx.playerFeet();
         int minY = Math.max(ctx.world().getMinY(), pf.y - SCAN_RADIUS);
@@ -359,6 +358,34 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
         return result;
     }
 
+    // Cache-first bed lookup shared with the brute-force fallback above.
+    // Cached positions are verified live (foot half, still a bed, in range)
+    // so stale entries can never produce a phantom bed.
+    private List<BlockPos> findCachedBeds() {
+        List<BlockPos> r = new ArrayList<>();
+        try {
+            var cachedWorld = baritone.getWorldProvider().getCurrentWorld().getCachedWorld();
+            if (cachedWorld == null) return r;
+            BetterBlockPos pf = ctx.playerFeet();
+            int minY = Math.max(ctx.world().getMinY(), pf.y - SCAN_RADIUS);
+            int maxY = Math.min(ctx.world().getMaxY(), pf.y + SCAN_RADIUS + 1);
+            for (net.minecraft.world.level.block.Block bed : BED_BLOCKS) {
+                String name = BlockUtils.blockToString(bed);
+                for (BlockPos pos : cachedWorld.getLocationsOf(name, Integer.MAX_VALUE, pf.x, pf.z, 2)) {
+                    if (Math.abs(pos.getX() - pf.x) > SCAN_RADIUS
+                            || Math.abs(pos.getZ() - pf.z) > SCAN_RADIUS
+                            || pos.getY() < minY || pos.getY() >= maxY) continue;
+                    BlockState state = ctx.world().getBlockState(pos);
+                    if (state.getBlock() == bed && state.getValue(BedBlock.PART) == BedPart.FOOT) r.add(pos);
+                }
+            }
+        } catch (Exception ignored) {
+            // Cache unavailable or registries not ready: caller falls back
+            // to the brute-force scan.
+        }
+        return r;
+    }
+
     /**
      * Returns {@code true} if the world's day-time is within the sleeping
      * window, or if a thunderstorm is currently active (which also enables
@@ -366,9 +393,7 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
      */
     private boolean isNightOrThunder() {
         long dayTime = ctx.world().getDayTime() % 24000L;
-        boolean isNight = dayTime >= NIGHT_START_TICK;
-        boolean isThunder = ctx.world().isThundering();
-        return isNight || isThunder;
+        return SleepWindow.canSleep(dayTime, ctx.world().isThundering());
     }
 
     /**

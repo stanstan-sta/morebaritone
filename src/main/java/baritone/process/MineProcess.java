@@ -361,7 +361,9 @@ public final class MineProcess extends BaritoneProcessHelper implements IMinePro
         List<Block> untracked = new ArrayList<>();
         for (BlockOptionalMeta bom : filter.blocks()) {
             Block block = bom.getBlock();
-            if (CachedChunk.BLOCKS_TO_KEEP_TRACK_OF.contains(block)) {
+            // Single registry: ChunkPacker stores per getBlocksToKeepTrackOf(),
+            // so the cache lookup must use the same set or tracked blocks miss.
+            if (CachedChunk.getBlocksToKeepTrackOf().contains(block)) {
                 BetterBlockPos pf = ctx.baritone.getPlayerContext().playerFeet();
 
                 // maxRegionDistanceSq 2 means adjacent directly or adjacent diagonally; nothing further than that

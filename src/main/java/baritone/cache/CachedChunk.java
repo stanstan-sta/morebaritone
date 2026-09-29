@@ -60,6 +60,11 @@ public final class CachedChunk {
         return blocksToKeepTrackOf;
     }
 
+    /**
+     * Legacy frozen copy of the tracked set. Kept for API compatibility only.
+     * Runtime code must use {@link #getBlocksToKeepTrackOf()} (the settings
+     * registry ChunkPacker stores), otherwise tracked blocks silently miss.
+     */
     @Deprecated
     public static final ImmutableSet<Block> BLOCKS_TO_KEEP_TRACK_OF = ImmutableSet.of(
             Blocks.ENDER_CHEST,
