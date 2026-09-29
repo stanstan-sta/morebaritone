@@ -118,7 +118,7 @@ public final class InteractBlockProcess extends BaritoneProcessHelper
                 // In range – switch to interaction phase
                 phase = Phase.INTERACTING;
                 interactTick = 0;
-                baritone.getPathingBehavior().cancelEverything();
+                return new PathingCommand(null, PathingCommandType.REQUEST_PAUSE);
             } else {
                 return new PathingCommand(new GoalGetToBlock(target),
                         PathingCommandType.REVALIDATE_GOAL_AND_PATH);

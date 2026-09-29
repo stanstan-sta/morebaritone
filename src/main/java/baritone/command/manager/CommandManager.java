@@ -126,7 +126,7 @@ public class CommandManager implements ICommandManager {
         return expand(string, false);
     }
 
-    private static final class ExecutionWrapper {
+    private final class ExecutionWrapper {
 
         private ICommand command;
         private String label;
@@ -142,12 +142,22 @@ public class CommandManager implements ICommandManager {
             try {
                 this.command.execute(this.label, this.args);
             } catch (Throwable t) {
+                String reason = t instanceof CommandException ? "invalid_args" : "interaction_failed";
+                if ("sleep".equalsIgnoreCase(label)) {
+                    baritone.getSleepInBedProcess().reportCommandFailure(reason);
+                } else if ("task".equalsIgnoreCase(label) || "craft".equalsIgnoreCase(label)) {
+                    baritone.getTaskPlanProcess().reportCommandFailure(label, reason);
+                }
                 // Create a handleable exception, wrap if needed
                 ICommandException exception = t instanceof ICommandException
                         ? (ICommandException) t
                         : new CommandUnhandledException(t);
 
                 exception.handle(command, args.getArgs());
+            } finally {
+                // A token is scoped to this command, including status/clear and rejected commands.
+                baritone.getTaskPlanProcess().setBridgeTaskToken(null);
+                baritone.getSleepInBedProcess().setBridgeTaskToken(null);
             }
         }
 

@@ -102,6 +102,8 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
     private int interactTick;
     private int calcFailCount;
     private boolean specificTarget; // true when caller supplied a position
+    private String pendingBridgeTaskToken;
+    private String activeBridgeTaskToken;
 
     public SleepInBedProcess(Baritone baritone) {
         super(baritone);
@@ -171,8 +173,7 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
 
     @Override
     public void onLostControl() {
-        reset();
-        phase = Phase.DONE;
+        if (isActive()) finish(TaskOutcome.CANCELLED);
         baritone.getInputOverrideHandler().clearAllKeys();
     }
 
@@ -393,6 +394,9 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
     // ─── internal helpers ─────────────────────────────────────────────────────
 
     private void reset() {
+        if (isActive()) finish(TaskOutcome.CANCELLED);
+        activeBridgeTaskToken = pendingBridgeTaskToken;
+        pendingBridgeTaskToken = null;
         baritone.getInputOverrideHandler().clearAllKeys();
         phase = Phase.SCANNING;
         targetBed = null;
@@ -404,10 +408,36 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
     }
 
     private void finish(TaskOutcome out) {
+        String token = activeBridgeTaskToken;
+        activeBridgeTaskToken = null;
         this.outcome = out;
         this.phase = Phase.DONE;
         this.targetBed = null;
         this.candidates = null;
         baritone.getInputOverrideHandler().clearAllKeys();
+        if (out == TaskOutcome.SUCCEEDED) {
+            logDirect("All queued tasks complete");
+            if (token != null) logBridgeStatus("Bridge task complete: " + token);
+        } else {
+            String status = out == TaskOutcome.CANCELLED ? "cancelled" : "failed";
+            logDirect("Task " + status + ": sleep - " + out.toWireString());
+            if (token != null) logBridgeStatus("Bridge task " + status + ": " + token + " - " + out.toWireString());
+        }
+    }
+
+    @baritone.KeepName
+    public void setBridgeTaskToken(String token) {
+        pendingBridgeTaskToken = token;
+    }
+
+    public void reportCommandFailure(String reason) {
+        String token = pendingBridgeTaskToken;
+        pendingBridgeTaskToken = null;
+        logDirect("Task failed: sleep - " + reason);
+        if (token != null) logBridgeStatus("Bridge task failed: " + token + " - " + reason);
+    }
+
+    private void logBridgeStatus(String message) {
+        logDirect(message, false);
     }
 }

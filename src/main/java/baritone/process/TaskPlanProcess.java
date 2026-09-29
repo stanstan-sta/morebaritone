@@ -137,10 +137,13 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     // -- Process-level state (queue + transient per-tick counters) -------------
     private final Deque<TaskPlanImpl> planQueue = new ArrayDeque<>();
     private TaskPlanImpl plan;
+    private String pendingBridgeTaskToken;
+    private String activeBridgeTaskToken;
     private int stepIdx;
 
     // Transient, reset between steps -- only valid while a plan is running.
     private int interactTick;
+    private int noFaceTick;
     private int calcFailCount;
     private int verifyTick;
     private int transferRemaining;
@@ -162,8 +165,29 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         if (plan == null) throw new IllegalArgumentException("plan must not be null");
         cancelPlan();
         this.plan = (TaskPlanImpl) plan;
+        this.activeBridgeTaskToken = pendingBridgeTaskToken;
+        this.plan.bridgeTaskToken = activeBridgeTaskToken;
+        this.pendingBridgeTaskToken = null;
         this.stepIdx = 0;
         advanceToStep(0);
+    }
+
+    /** Bridge-only provenance token copied onto the next plan started by a command. */
+    @baritone.KeepName
+    public void setBridgeTaskToken(String token) {
+        this.pendingBridgeTaskToken = token;
+    }
+
+    /** Report a rejected command even when no plan was created. */
+    public void reportCommandFailure(String label, String reason) {
+        String token = pendingBridgeTaskToken;
+        pendingBridgeTaskToken = null;
+        logDirect("Task failed: " + label + " - " + reason);
+        if (token != null) logBridgeStatus("Bridge task failed: " + token + " - " + reason);
+    }
+
+    private void logBridgeStatus(String message) {
+        logDirect(message, false);
     }
 
     // -- Factory: run variants -------------------------------------------------
@@ -212,7 +236,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
             throw new IllegalArgumentException("blockName must not be null or empty");
         BlockPos target = findPositionForBlock(blockName, maxSearchRadius);
         if (target == null) {
-            logDirect("TaskPlan[" + blockName + "]: no cached positions found");
+            reportCommandFailure("interact_block", "not_found");
             return null;
         }
         return runInteractPlan(target);
@@ -223,7 +247,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         net.minecraft.world.level.block.Block block = blockFromName(blockName);
         BlockPos target = findNearestBlock(blockName, block, maxSearchRadius);
         if (target == null) {
-            logDirect("TaskPlan[" + blockName + "]: no positions found");
+            reportCommandFailure("container_interact", "not_found");
             return null;
         }
         return runContainerPlan(target, action);
@@ -252,7 +276,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     public void createInteractPlan(String blockName, int maxSearchRadius) {
         BlockPos target = findPositionForBlock(blockName, maxSearchRadius);
         if (target == null) {
-            logDirect("TaskPlan[" + blockName + "]: no cached positions found");
+            reportCommandFailure("interact_block", "not_found");
             return;
         }
         createInteractPlan(target);
@@ -276,7 +300,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         net.minecraft.world.level.block.Block block = blockFromName(blockName);
         BlockPos target = findNearestBlock(blockName, block, maxSearchRadius);
         if (target == null) {
-            logDirect("TaskPlan[" + blockName + "]: no positions found");
+            reportCommandFailure("container_interact", "not_found");
             return;
         }
         createContainerPlan(target, action);
@@ -302,7 +326,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     public ITaskPlan runSmeltAllItems(String furnaceBlockName, int maxSearchRadius) {
         List<net.minecraft.world.item.Item> smeltable = findSmeltableItemsInInventory();
         if (smeltable.isEmpty()) {
-            logDirect("TaskPlan: no smeltable items found in inventory");
+            reportCommandFailure("smelt_items", "not_found");
             return null;
         }
         if (furnaceBlockName == null || furnaceBlockName.isEmpty()) furnaceBlockName = "furnace";
@@ -313,6 +337,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 runPlan(p);
                 first = p;
             } else {
+                p.bridgeTaskToken = ((TaskPlanImpl) first).bridgeTaskToken;
                 enqueuePlan(p);
             }
         }
@@ -325,12 +350,14 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     public void createSmeltAllItems(String furnaceBlockName, int maxSearchRadius) {
         List<net.minecraft.world.item.Item> smeltable = findSmeltableItemsInInventory();
         if (smeltable.isEmpty()) {
-            logDirect("TaskPlan: no smeltable items found in inventory");
+            reportCommandFailure("smelt_items", "not_found");
             return;
         }
         if (furnaceBlockName == null || furnaceBlockName.isEmpty()) furnaceBlockName = "furnace";
+        String token = pendingBridgeTaskToken;
         for (net.minecraft.world.item.Item item : smeltable) {
             TaskPlanImpl p = buildSmeltPlan(item, -1, furnaceBlockName, maxSearchRadius);
+            p.bridgeTaskToken = token;
             enqueuePlan(p);
         }
         logDirect(String.format("TaskPlan: smelt-all queued %d item type(s) on %s",
@@ -427,8 +454,11 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     public void enqueuePlan(ITaskPlan p) {
         if (p == null) throw new IllegalArgumentException("plan must not be null");
         TaskPlanImpl impl = (TaskPlanImpl) p;
+        if (pendingBridgeTaskToken != null) impl.bridgeTaskToken = pendingBridgeTaskToken;
+        pendingBridgeTaskToken = null;
         if (plan == null) {
             this.plan = impl;
+            this.activeBridgeTaskToken = impl.bridgeTaskToken;
             this.stepIdx = 0;
             advanceToStep(0);
         } else {
@@ -446,6 +476,10 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     public void clearQueue() {
         if (planQueue.isEmpty()) return;
         int removed = planQueue.size();
+        for (TaskPlanImpl queued : planQueue) {
+            queued.markCancelled();
+            for (TaskStepImpl step : queued.mutableSteps()) step.cancel();
+        }
         planQueue.clear();
         logDirect("TaskPlan: cleared " + removed + " queued plan(s)");
     }
@@ -559,9 +593,18 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         }
         Optional<Rotation> rot = RotationUtils.reachable(ctx, tp, reachDist());
         if (!rot.isPresent()) {
+            BetterBlockPos pf = ctx.playerFeet();
+            if (!new GoalGetToBlock(tp).isInGoal(pf.x, pf.y, pf.z)) {
+                // Still approaching: keep navigating without consuming the bound.
+                interactTick = 0;
+                noFaceTick = 0;
+                return new PathingCommand(new GoalGetToBlock(tp), PathingCommandType.REVALIDATE_GOAL_AND_PATH);
+            }
+            if (++noFaceTick >= INTERACT_TIMEOUT) { failStep(TaskOutcome.UNREACHABLE); return cancelPath(); }
             interactTick = 0;
             return new PathingCommand(new GoalGetToBlock(tp), PathingCommandType.REVALIDATE_GOAL_AND_PATH);
         }
+        noFaceTick = 0;
         baritone.getLookBehavior().updateTarget(rot.get(), true);
         if (interactTick == 0 || interactTick % 4 == 0) {
             sendUsePacket(tp);
@@ -597,25 +640,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         if (menu instanceof InventoryMenu) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
         ContainerAction action = plan.containerAction;
         if (action == null) { succeedStep(); return pause(); }
-        if (!menu.getCarried().isEmpty()) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
-        int src = findTransferSourceSlot(menu, action);
-        if (src < 0) {
-            if (action.movesAllMatchingItems()) { succeedStep(); }
-            else { failStep(TaskOutcome.NOT_FOUND); }
-            return pause();
-        }
-        int cnt = menu.getSlot(src).getItem().getCount();
-        if (transferRemaining > 0 && cnt > transferRemaining) {
-            int empty = findFirstEmptyOppositeSlot(menu, action);
-            if (empty < 0) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
-            transferPhase = TRANSFER_PHASE_PLACE_TEMP;
-            transferSourceSlot = src;
-            transferTempSlot = empty;
-            transferGrabbed = cnt;
-            transferToReturn = cnt - transferRemaining;
-            ctx.playerController().windowClick(menu.containerId, src, 0, ClickType.PICKUP, ctx.player());
-            return pause();
-        }
+        // Finish an in-flight split before looking for another source stack.
         if (transferPhase == TRANSFER_PHASE_PLACE_TEMP) {
             if (menu.getCarried().isEmpty()) return pause();
             ctx.playerController().windowClick(menu.containerId, transferTempSlot, 0, ClickType.PICKUP, ctx.player());
@@ -644,12 +669,32 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
             succeedStep();
             return pause();
         }
+        if (!menu.getCarried().isEmpty()) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
+        int src = findTransferSourceSlot(menu, action);
+        if (src < 0) {
+            if (action.movesAllMatchingItems()) { succeedStep(); }
+            else { failStep(TaskOutcome.NOT_FOUND); }
+            return pause();
+        }
+        int cnt = menu.getSlot(src).getItem().getCount();
+        if (transferRemaining > 0 && cnt > transferRemaining) {
+            int empty = findFirstEmptyOppositeSlot(menu, action);
+            if (empty < 0) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
+            transferPhase = TRANSFER_PHASE_PLACE_TEMP;
+            transferSourceSlot = src;
+            transferTempSlot = empty;
+            transferGrabbed = cnt;
+            transferToReturn = cnt - transferRemaining;
+            ctx.playerController().windowClick(menu.containerId, src, 0, ClickType.PICKUP, ctx.player());
+            return pause();
+        }
         ItemStack before = menu.getSlot(src).getItem().copy();
         ctx.playerController().windowClick(menu.containerId, src, 0, ClickType.QUICK_MOVE, ctx.player());
         ItemStack after = menu.getSlot(src).getItem();
         boolean moved = after.isEmpty() || after.getItem() != before.getItem() || after.getCount() != before.getCount();
         if (!moved) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
-        if (transferRemaining > 0) transferRemaining -= before.getCount();
+        if (transferRemaining > 0) transferRemaining -= before.getCount()
+                - (after.isEmpty() || after.getItem() != before.getItem() ? 0 : after.getCount());
         if (transferRemaining <= 0 && !action.movesAllMatchingItems()) succeedStep();
         return pause();
     }
@@ -703,7 +748,6 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 failStep(TaskOutcome.OCCUPIED); return cancelPath();
             }
             interactTick = 0;
-            baritone.getPathingBehavior().cancelEverything();
             succeedStep();
             return pause();
         }
@@ -821,6 +865,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         if (menu instanceof InventoryMenu) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
         if (menu.getSlot(2).hasItem()) { succeedStep(); return pause(); }
         if (!hasSmeltInputInInventory(menu) && !isSmeltInputSlot(menu.getSlot(0))) {
+            if (!isSmeltTargetMet()) { failStep(TaskOutcome.INTERACTION_FAILED); return cancelPath(); }
             succeedStep();
             return pause();
         }
@@ -879,11 +924,17 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 plan.smeltMonitorTick = 0;
                 ctx.player().closeContainer();
                 stepIdx = 0;
+            } else if (!isSmeltTargetMet()) {
+                failStep(TaskOutcome.INTERACTION_FAILED);
+                return cancelPath();
             }
         } else if (hasSmeltInputInInventory(menu) || isSmeltInputSlot(menu.getSlot(0))) {
             plan.smeltLoadPhase = LOAD_PHASE_FUEL;
             plan.smeltMonitorTick = 0;
             stepIdx = 3;
+        } else if (!isSmeltTargetMet()) {
+            failStep(TaskOutcome.INTERACTION_FAILED);
+            return cancelPath();
         }
         succeedStep();
         return pause();
@@ -940,9 +991,10 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
                 || item == Items.FISHING_ROD || item == Items.CROSSBOW) {
             return true;
         }
-        // Logs and planks
+        // Quick-move sends logs/wood to the input slot (charcoal), not fuel.
         String id = BuiltInRegistries.ITEM.getKey(item).toString();
-        return id.endsWith("_log") || id.endsWith("_wood") || id.endsWith("_planks");
+        return id.endsWith("_planks") && !id.equals("minecraft:crimson_planks")
+                && !id.equals("minecraft:warped_planks");
     }
 
     private boolean hasSmeltInputInInventory(AbstractContainerMenu menu) {
@@ -962,6 +1014,10 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
 
     private boolean isMultiFurnaceSmelt() {
         return plan != null && plan.smeltFurnaces != null && plan.smeltFurnaces.size() > 1;
+    }
+
+    private boolean isSmeltTargetMet() {
+        return plan == null || plan.smeltTargetCount <= 0 || plan.smeltedSoFar >= plan.smeltTargetCount;
     }
 
     private List<net.minecraft.world.item.Item> resolveSmeltInputs(net.minecraft.world.item.Item requestedItem) {
@@ -1073,7 +1129,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     // --- Plan/step lifecycle helpers -----------------------------------------
 
     private void advanceToStep(int idx) {
-        interactTick = calcFailCount = verifyTick = 0;
+        interactTick = noFaceTick = calcFailCount = verifyTick = 0;
         ContainerAction action = plan.containerAction;
         transferRemaining = action == null ? 0 : (action.movesAllMatchingItems() ? -1 : action.getCount());
         transferPhase = TRANSFER_PHASE_NONE;
@@ -1085,8 +1141,9 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
 
     private void clearState() {
         plan = null;
+        activeBridgeTaskToken = null;
         stepIdx = 0;
-        interactTick = calcFailCount = verifyTick = 0;
+        interactTick = noFaceTick = calcFailCount = verifyTick = 0;
         transferRemaining = 0;
         transferPhase = TRANSFER_PHASE_NONE;
         transferSourceSlot = transferTempSlot = -1;
@@ -1102,29 +1159,44 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     }
     private void finishPlan(TaskOutcome o) {
         String label = plan.label();
+        String bridgeToken = activeBridgeTaskToken;
         plan.markSucceeded();
         clearState();
         logDirect("Task complete: " + label);
+        boolean bridgeCommandComplete = bridgeToken != null && (planQueue.isEmpty()
+                || !bridgeToken.equals(planQueue.peekFirst().bridgeTaskToken));
         if (!planQueue.isEmpty()) {
             this.plan = planQueue.pollFirst();
+            this.activeBridgeTaskToken = plan.bridgeTaskToken;
             this.stepIdx = 0;
             advanceToStep(0);
         } else {
             logDirect("All queued tasks complete");
         }
+        if (bridgeCommandComplete) logBridgeStatus("Bridge task complete: " + bridgeToken);
     }
     private void abortPlan(TaskOutcome r) {
         if (plan == null) return;
         String label = plan.label();
+        String bridgeToken = activeBridgeTaskToken;
+        boolean cancelled = r == TaskOutcome.CANCELLED;
         if (stepIdx < plan.mutableSteps().size()) {
             TaskStepImpl cur = plan.mutableSteps().get(stepIdx);
-            if (cur.status() == StepStatus.RUNNING) cur.fail(r);
+            if (cur.status() == StepStatus.RUNNING) {
+                if (cancelled) cur.cancel(); else cur.fail(r);
+            }
         }
         for (int i = stepIdx + 1; i < plan.mutableSteps().size(); i++) plan.mutableSteps().get(i).cancel();
-        plan.markFailed(r);
-        logDirect("Task failed: " + label + " - " + r.toWireString());
+        if (cancelled) plan.markCancelled(); else plan.markFailed(r);
+        if (ctx.player() != null && !(ctx.player().containerMenu instanceof InventoryMenu)) {
+            ctx.player().closeContainer();
+        }
+        baritone.getInputOverrideHandler().clearAllKeys();
         clearState();
-        planQueue.clear();
+        clearQueue();
+        logDirect((cancelled ? "Task cancelled: " : "Task failed: ") + label + " - " + r.toWireString());
+        if (bridgeToken != null) logBridgeStatus((cancelled ? "Bridge task cancelled: " : "Bridge task failed: ")
+                + bridgeToken + " - " + r.toWireString());
     }
 
     // --- Block-finding utilities ----------------------------------------------

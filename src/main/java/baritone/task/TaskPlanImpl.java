@@ -53,6 +53,7 @@ public final class TaskPlanImpl implements ITaskPlan {
     // ─── Per-plan execution context (isolated from process instance fields) ──
     public BlockPos targetPos;
     public ContainerAction containerAction;
+    public String bridgeTaskToken;
     public List<BlockPos> bedCandidates;
 
     // Smelt plan context
