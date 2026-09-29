@@ -1111,7 +1111,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         if (found.isEmpty()) {
             java.util.List<net.minecraft.world.level.block.Block> target = java.util.Collections.singletonList(block);
             java.util.List<BlockPos> scanned = BaritoneAPI.getProvider().getWorldScanner()
-                    .scanChunkRadius(ctx, target, Math.max(0, maxSearchRadius * 16), 0, 256);
+                    .scanChunkRadius(ctx, target, 256, -1, loadedChunkRadiusForRegionDistance(maxSearchRadius));
             if (scanned != null) {
                 found.addAll(scanned);
             }
@@ -1209,23 +1209,26 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     // --- Block-finding utilities ----------------------------------------------
 
     private BlockPos findPositionForBlock(String blockName, int maxSearchRadius) {
-        var cachedWorld = baritone.getWorldProvider().getCurrentWorld().getCachedWorld();
-        if (cachedWorld == null) { logDirect("TaskPlan: no cached world"); return null; }
-        BetterBlockPos pf = ctx.playerFeet();
-        ArrayList<BlockPos> positions = cachedWorld.getLocationsOf(blockName, Integer.MAX_VALUE, pf.x, pf.z, maxSearchRadius);
-        if (positions.isEmpty()) {
-            BaritoneAPI.getProvider().getWorldScanner().repack(ctx);
-            positions = cachedWorld.getLocationsOf(blockName, Integer.MAX_VALUE, pf.x, pf.z, maxSearchRadius);
-        }
-        if (positions.isEmpty()) return null;
-        positions.sort((a, b) -> Double.compare(pf.distSqr(a), pf.distSqr(b)));
-        return positions.get(0);
+        net.minecraft.world.level.block.Block block = blockFromName(blockName);
+        return findNearestBlock(blockName, block, maxSearchRadius);
     }
 
     private static net.minecraft.world.level.block.Block blockFromName(String name) {
         for (net.minecraft.world.level.block.Block b : BuiltInRegistries.BLOCK)
             if (BuiltInRegistries.BLOCK.getKey(b).getPath().equals(name)) return b;
         return null;
+    }
+
+    /**
+     * Cached-world search radius is expressed as squared region distance.
+     * A direct fallback can only inspect loaded chunks, so cap it to the same
+     * 40-chunk horizon used by the cache repacker rather than accidentally
+     * scanning 256 chunks.
+     */
+    static int loadedChunkRadiusForRegionDistance(int maxRegionDistanceSq) {
+        int nonNegative = Math.max(0, maxRegionDistanceSq);
+        int regionRadius = (int) Math.ceil(Math.sqrt(nonNegative));
+        return Math.min(40, Math.max(1, (regionRadius + 1) * 32));
     }
 
     private BlockPos findNearestBlock(String blockName, net.minecraft.world.level.block.Block block, int maxSearchRadius) {
@@ -1244,7 +1247,7 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
         if (block != null) {
             java.util.List<net.minecraft.world.level.block.Block> target = java.util.Collections.singletonList(block);
             java.util.List<BlockPos> scanned = BaritoneAPI.getProvider().getWorldScanner()
-                    .scanChunkRadius(ctx, target, Math.max(0, maxSearchRadius * 16), 0, 256);
+                    .scanChunkRadius(ctx, target, 256, -1, loadedChunkRadiusForRegionDistance(maxSearchRadius));
             if (scanned != null && !scanned.isEmpty()) { scanned.sort((a, b) -> Double.compare(pf.distSqr(a), pf.distSqr(b))); return scanned.get(0); }
         }
         return null;
@@ -1253,22 +1256,29 @@ public final class TaskPlanProcess extends BaritoneProcessHelper
     // --- World helpers --------------------------------------------------------
 
     private List<BlockPos> findNearbyBeds() {
-        // Cache-first: beds are tracked blocks, so a cache hit avoids the
-        // ~2M-block brute-force cube scan below on the tick thread.
+        // Cache-first; if the cache is cold, scan only currently loaded chunks
+        // within the 64-block radius instead of walking a ~2M-block cube on
+        // the client tick thread.
         List<BlockPos> cached = findCachedBeds(BED_SCAN_RADIUS);
         if (!cached.isEmpty()) return cached;
-        List<BlockPos> r = new ArrayList<>();
+
         BetterBlockPos pf = ctx.playerFeet();
         int minY = Math.max(ctx.world().getMinY(), pf.y - BED_SCAN_RADIUS);
         int maxY = Math.min(ctx.world().getMaxY(), pf.y + BED_SCAN_RADIUS + 1);
-        for (int x = pf.x - BED_SCAN_RADIUS; x <= pf.x + BED_SCAN_RADIUS; x++)
-            for (int z = pf.z - BED_SCAN_RADIUS; z <= pf.z + BED_SCAN_RADIUS; z++)
-                for (int y = minY; y < maxY; y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    BlockState state = ctx.world().getBlockState(pos);
-                    if (BED_BLOCKS.contains(state.getBlock()) && state.getValue(BedBlock.PART) == BedPart.FOOT) r.add(pos);
-                }
-        return r;
+        int chunkRadius = Math.max(1, (BED_SCAN_RADIUS + 15) / 16);
+        List<BlockPos> scanned = BaritoneAPI.getProvider().getWorldScanner()
+                .scanChunkRadius(ctx, BED_BLOCKS, 256, -1, chunkRadius);
+        List<BlockPos> result = new ArrayList<>();
+        for (BlockPos pos : scanned) {
+            if (Math.abs(pos.getX() - pf.x) > BED_SCAN_RADIUS
+                    || Math.abs(pos.getZ() - pf.z) > BED_SCAN_RADIUS
+                    || pos.getY() < minY || pos.getY() >= maxY) continue;
+            BlockState state = ctx.world().getBlockState(pos);
+            if (BED_BLOCKS.contains(state.getBlock()) && state.getValue(BedBlock.PART) == BedPart.FOOT) {
+                result.add(pos);
+            }
+        }
+        return result;
     }
 
     // Cache-first bed lookup shared with the brute-force fallback above.

@@ -332,27 +332,26 @@ public final class SleepInBedProcess extends BaritoneProcessHelper
      * for the same physical bed).
      */
     private List<BlockPos> findNearbyBeds() {
-        // Cache-first: beds are tracked blocks, so a cache hit avoids the
-        // ~2M-block brute-force cube scan below on the tick thread.
+        // Cache-first; if the cache is cold, scan only currently loaded chunks
+        // within the 64-block radius instead of walking a ~2M-block cube on
+        // the client tick thread.
         List<BlockPos> cached = findCachedBeds();
         if (!cached.isEmpty()) return cached;
-        List<BlockPos> result = new ArrayList<>();
+
         BetterBlockPos pf = ctx.playerFeet();
         int minY = Math.max(ctx.world().getMinY(), pf.y - SCAN_RADIUS);
         int maxY = Math.min(ctx.world().getMaxY(), pf.y + SCAN_RADIUS + 1);
-
-        for (int x = pf.x - SCAN_RADIUS; x <= pf.x + SCAN_RADIUS; x++) {
-            for (int z = pf.z - SCAN_RADIUS; z <= pf.z + SCAN_RADIUS; z++) {
-                for (int y = minY; y < maxY; y++) {
-                    BlockPos pos = new BlockPos(x, y, z);
-                    BlockState state = ctx.world().getBlockState(pos);
-                    if (BED_BLOCKS.contains(state.getBlock())) {
-                        // Only include the foot part to avoid duplicates
-                        if (state.getValue(BedBlock.PART) == BedPart.FOOT) {
-                            result.add(pos);
-                        }
-                    }
-                }
+        int chunkRadius = Math.max(1, (SCAN_RADIUS + 15) / 16);
+        List<BlockPos> scanned = BaritoneAPI.getProvider().getWorldScanner()
+                .scanChunkRadius(ctx, BED_BLOCKS, 256, -1, chunkRadius);
+        List<BlockPos> result = new ArrayList<>();
+        for (BlockPos pos : scanned) {
+            if (Math.abs(pos.getX() - pf.x) > SCAN_RADIUS
+                    || Math.abs(pos.getZ() - pf.z) > SCAN_RADIUS
+                    || pos.getY() < minY || pos.getY() >= maxY) continue;
+            BlockState state = ctx.world().getBlockState(pos);
+            if (BED_BLOCKS.contains(state.getBlock()) && state.getValue(BedBlock.PART) == BedPart.FOOT) {
+                result.add(pos);
             }
         }
         return result;
